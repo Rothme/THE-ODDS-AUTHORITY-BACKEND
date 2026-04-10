@@ -1,220 +1,182 @@
 /**
- * GoalScope Backend — API-Football Proxy Server
+ * The Odds Authority — Backend Proxy Server v3
  * ─────────────────────────────────────────────
- * Sits between your users and API-Football.
  * Your API key never reaches the browser.
  *
- * Endpoints exposed to the frontend:
- *   GET /api/teams?search=<name>
+ * Routes:
+ *   GET /health
+ *   GET /api/teams?search=<n>
  *   GET /api/fixtures?team=<id>&next=<n>
  *   GET /api/fixtures/last?team=<id>&last=<n>
  *   GET /api/stats?team=<id>&league=<id>&season=<year>
  *   GET /api/leagues?team=<id>&current=true
- *   GET /health
+ *   GET /api/predictions?fixture=<id>
+ *   GET /api/h2h?h2h=<id1-id2>&last=<n>
+ *   GET /api/standings?league=<id>&season=<year>
+ *   GET /api/injuries?fixture=<id>
  */
 
 require('dotenv').config();
-const express  = require('express');
-const cors     = require('cors');
+const express   = require('express');
+const cors      = require('cors');
 const NodeCache = require('node-cache');
-const https    = require('https');
+const https     = require('https');
 
 const app   = express();
 const cache = new NodeCache({ stdTTL: parseInt(process.env.CACHE_TTL) || 300 });
 
-// ── CORS ────────────────────────────────────────────────────
-const rawOrigins = process.env.ALLOWED_ORIGINS || '*';
-const corsOptions = rawOrigins === '*'
+// ── CORS ──────────────────────────────────────────────────────
+const rawOrigins = (process.env.ALLOWED_ORIGINS || '*').trim();
+app.use(cors(rawOrigins === '*'
   ? { origin: '*' }
   : {
-      origin: function (origin, callback) {
+      origin(origin, cb) {
         const list = rawOrigins.split(',').map(o => o.trim());
-        if (!origin || list.includes(origin)) return callback(null, true);
-        callback(new Error('CORS blocked: ' + origin));
+        (!origin || list.includes(origin)) ? cb(null, true) : cb(new Error('CORS: ' + origin));
       }
-    };
-app.use(cors(corsOptions));
+    }
+));
 app.use(express.json());
 
-// ── CONFIG ───────────────────────────────────────────────────
+// ── API-FOOTBALL FETCH ────────────────────────────────────────
 const API_KEY  = process.env.API_FOOTBALL_KEY;
-const API_BASE = 'v3.football.api-sports.io';
+const API_HOST = 'v3.football.api-sports.io';
 
-if (!API_KEY || API_KEY === 'YOUR_API_FOOTBALL_KEY_HERE') {
-  console.warn('\n⚠️  WARNING: API_FOOTBALL_KEY not set in .env\n');
+if (!API_KEY || API_KEY === 'YOUR_KEY_HERE') {
+  console.warn('\n⚠  WARNING: API_FOOTBALL_KEY not set in .env\n');
 }
 
-// ── API-FOOTBALL FETCH ────────────────────────────────────────
-function apiFootball(path) {
+function apiFetch(path) {
   return new Promise((resolve, reject) => {
-    const cacheKey = path;
-    const cached = cache.get(cacheKey);
-    if (cached) {
-      console.log(`[CACHE HIT] ${path}`);
-      return resolve(cached);
-    }
+    const hit = cache.get(path);
+    if (hit) { console.log(`[CACHE] ${path}`); return resolve(hit); }
 
-    const options = {
-      hostname: API_BASE,
-      path: path,
-      method: 'GET',
-      headers: {
-        'x-apisports-key': API_KEY
+    console.log(`[API]   https://${API_HOST}${path}`);
+    const req = https.request(
+      { hostname: API_HOST, path, method: 'GET', headers: { 'x-apisports-key': API_KEY } },
+      res => {
+        let raw = '';
+        res.on('data', c => raw += c);
+        res.on('end', () => {
+          try {
+            const parsed = JSON.parse(raw);
+            if (parsed.results !== undefined) cache.set(path, parsed);
+            resolve(parsed);
+          } catch(e) { reject(new Error('Parse error')); }
+        });
       }
-    };
-
-    console.log(`[API CALL] https://${API_BASE}${path}`);
-
-    const req = https.request(options, (res) => {
-      let data = '';
-      res.on('data', chunk => data += chunk);
-      res.on('end', () => {
-        try {
-          const parsed = JSON.parse(data);
-          // Cache only successful responses with results
-          if (parsed.results !== undefined) {
-            cache.set(cacheKey, parsed);
-          }
-          resolve(parsed);
-        } catch (e) {
-          reject(new Error('Failed to parse API response'));
-        }
-      });
-    });
-
-    req.on('error', err => reject(err));
+    );
+    req.on('error', reject);
     req.end();
   });
 }
 
-// ── MIDDLEWARE: key guard ─────────────────────────────────────
-function keyGuard(req, res, next) {
-  if (!API_KEY || API_KEY === 'YOUR_API_FOOTBALL_KEY_HERE') {
-    return res.status(503).json({
-      error: true,
-      message: 'Server not configured — API key missing. Set API_FOOTBALL_KEY in .env'
-    });
-  }
+// ── KEY GUARD ─────────────────────────────────────────────────
+function guard(req, res, next) {
+  if (!API_KEY || API_KEY === 'YOUR_KEY_HERE')
+    return res.status(503).json({ error: true, message: 'API key not configured on server.' });
   next();
 }
 
 // ── ROUTES ────────────────────────────────────────────────────
 
-// Health check (Render uses this to confirm the service is alive)
-app.get('/health', (req, res) => {
-  res.json({
-    status: 'ok',
-    service: 'GoalScope Backend',
-    timestamp: new Date().toISOString(),
-    apiKeySet: !!(API_KEY && API_KEY !== 'YOUR_API_FOOTBALL_KEY_HERE'),
-    cacheKeys: cache.keys().length
-  });
-});
+// Health check
+app.get('/health', (req, res) => res.json({
+  status: 'ok',
+  service: 'The Odds Authority Backend v3',
+  timestamp: new Date().toISOString(),
+  apiKeySet: !!(API_KEY && API_KEY !== 'YOUR_KEY_HERE'),
+  cached: cache.keys().length
+}));
 
-// Team search — autocomplete
-// GET /api/teams?search=arsenal
-app.get('/api/teams', keyGuard, async (req, res) => {
+// Team search autocomplete
+app.get('/api/teams', guard, async (req, res) => {
   const { search } = req.query;
-  if (!search || search.trim().length < 3) {
-    return res.status(400).json({ error: true, message: 'search param must be at least 3 characters' });
-  }
-  try {
-    const data = await apiFootball(`/teams?search=${encodeURIComponent(search.trim())}`);
-    res.json(data);
-  } catch (e) {
-    res.status(502).json({ error: true, message: e.message });
-  }
+  if (!search || search.trim().length < 3)
+    return res.status(400).json({ error: true, message: 'Minimum 3 characters required' });
+  try { res.json(await apiFetch(`/teams?search=${encodeURIComponent(search.trim())}`)); }
+  catch(e) { res.status(502).json({ error: true, message: e.message }); }
 });
 
-// Upcoming fixtures for a team
-// GET /api/fixtures?team=33&next=5
-app.get('/api/fixtures', keyGuard, async (req, res) => {
-  const { team, next, status } = req.query;
-  if (!team) return res.status(400).json({ error: true, message: 'team param required' });
-  const n = parseInt(next) || 5;
-  const st = status || 'NS';
-  try {
-    const data = await apiFootball(`/fixtures?team=${team}&next=${n}&status=${st}`);
-    res.json(data);
-  } catch (e) {
-    res.status(502).json({ error: true, message: e.message });
-  }
+// Upcoming fixtures — uses next= with no status filter so all scheduled games appear
+app.get('/api/fixtures', guard, async (req, res) => {
+  const { team, next } = req.query;
+  if (!team) return res.status(400).json({ error: true, message: 'team required' });
+  try { res.json(await apiFetch(`/fixtures?team=${team}&next=${next||5}`)); }
+  catch(e) { res.status(502).json({ error: true, message: e.message }); }
 });
 
-// Last N fixtures (for form context)
-// GET /api/fixtures/last?team=33&last=5
-app.get('/api/fixtures/last', keyGuard, async (req, res) => {
+// Last N fixtures for form context
+app.get('/api/fixtures/last', guard, async (req, res) => {
   const { team, last } = req.query;
-  if (!team) return res.status(400).json({ error: true, message: 'team param required' });
-  const n = parseInt(last) || 5;
-  try {
-    const data = await apiFootball(`/fixtures?team=${team}&last=${n}`);
-    res.json(data);
-  } catch (e) {
-    res.status(502).json({ error: true, message: e.message });
-  }
+  if (!team) return res.status(400).json({ error: true, message: 'team required' });
+  try { res.json(await apiFetch(`/fixtures?team=${team}&last=${last||5}`)); }
+  catch(e) { res.status(502).json({ error: true, message: e.message }); }
 });
 
-// Team season statistics
-// GET /api/stats?team=33&league=39&season=2024
-app.get('/api/stats', keyGuard, async (req, res) => {
+// Season statistics — tries current season first, falls back to previous
+app.get('/api/stats', guard, async (req, res) => {
   const { team, league, season } = req.query;
-  if (!team || !league || !season) {
-    return res.status(400).json({ error: true, message: 'team, league, and season params required' });
-  }
+  if (!team || !league || !season)
+    return res.status(400).json({ error: true, message: 'team, league, season required' });
   try {
-    const data = await apiFootball(`/teams/statistics?team=${team}&league=${league}&season=${season}`);
+    const data = await apiFetch(`/teams/statistics?team=${team}&league=${league}&season=${season}`);
+    // If no data returned for this season, try the previous season automatically
+    if (!data.response || !data.response.fixtures) {
+      const prev = parseInt(season) - 1;
+      const fallback = await apiFetch(`/teams/statistics?team=${team}&league=${league}&season=${prev}`);
+      return res.json(fallback);
+    }
     res.json(data);
-  } catch (e) {
-    res.status(502).json({ error: true, message: e.message });
-  }
+  } catch(e) { res.status(502).json({ error: true, message: e.message }); }
 });
 
-// Leagues a team is in (to discover leagueId + season)
-// GET /api/leagues?team=33&current=true
-app.get('/api/leagues', keyGuard, async (req, res) => {
+// Leagues for a team — always fetch current=true to get active season year
+app.get('/api/leagues', guard, async (req, res) => {
   const { team, current } = req.query;
-  if (!team) return res.status(400).json({ error: true, message: 'team param required' });
-  const cur = current === 'true' ? '&current=true' : '';
-  try {
-    const data = await apiFootball(`/leagues?team=${team}${cur}`);
-    res.json(data);
-  } catch (e) {
-    res.status(502).json({ error: true, message: e.message });
-  }
+  if (!team) return res.status(400).json({ error: true, message: 'team required' });
+  try { res.json(await apiFetch(`/leagues?team=${team}${current === 'true' ? '&current=true' : ''}`)); }
+  catch(e) { res.status(502).json({ error: true, message: e.message }); }
+});
+
+// Predictions — returns winner, win/draw/away %, under/over, predicted goals, comparison
+app.get('/api/predictions', guard, async (req, res) => {
+  const { fixture } = req.query;
+  if (!fixture) return res.status(400).json({ error: true, message: 'fixture id required' });
+  try { res.json(await apiFetch(`/predictions?fixture=${fixture}`)); }
+  catch(e) { res.status(502).json({ error: true, message: e.message }); }
 });
 
 // Head-to-head
-// GET /api/h2h?h2h=33-34&last=10
-app.get('/api/h2h', keyGuard, async (req, res) => {
+app.get('/api/h2h', guard, async (req, res) => {
   const { h2h, last } = req.query;
-  if (!h2h) return res.status(400).json({ error: true, message: 'h2h param required (e.g. 33-34)' });
-  const n = parseInt(last) || 10;
-  try {
-    const data = await apiFootball(`/fixtures/headtohead?h2h=${h2h}&last=${n}`);
-    res.json(data);
-  } catch (e) {
-    res.status(502).json({ error: true, message: e.message });
-  }
+  if (!h2h) return res.status(400).json({ error: true, message: 'h2h required (e.g. 33-34)' });
+  try { res.json(await apiFetch(`/fixtures/headtohead?h2h=${h2h}&last=${last||10}`)); }
+  catch(e) { res.status(502).json({ error: true, message: e.message }); }
 });
 
-// Cache stats (admin use)
-app.get('/api/cache-stats', (req, res) => {
-  res.json({
-    keys: cache.keys().length,
-    stats: cache.getStats()
-  });
+// League standings
+app.get('/api/standings', guard, async (req, res) => {
+  const { league, season } = req.query;
+  if (!league || !season) return res.status(400).json({ error: true, message: 'league, season required' });
+  try { res.json(await apiFetch(`/standings?league=${league}&season=${season}`)); }
+  catch(e) { res.status(502).json({ error: true, message: e.message }); }
+});
+
+// Injuries for a fixture
+app.get('/api/injuries', guard, async (req, res) => {
+  const { fixture } = req.query;
+  if (!fixture) return res.status(400).json({ error: true, message: 'fixture id required' });
+  try { res.json(await apiFetch(`/injuries?fixture=${fixture}`)); }
+  catch(e) { res.status(502).json({ error: true, message: e.message }); }
 });
 
 // 404
-app.use((req, res) => {
-  res.status(404).json({ error: true, message: 'Route not found' });
-});
+app.use((req, res) => res.status(404).json({ error: true, message: 'Not found' }));
 
 // ── START ─────────────────────────────────────────────────────
 const PORT = parseInt(process.env.PORT) || 3000;
 app.listen(PORT, () => {
-  console.log(`\n🚀 GoalScope Backend running on port ${PORT}`);
-  console.log(`   Health check: http://localhost:${PORT}/health`);
-  console.log(`   API key set:  ${!!(API_KEY && API_KEY !== 'YOUR_API_FOOTBALL_KEY_HERE')}\n`);
+  console.log(`\n🚀  The Odds Authority Backend v3  →  port ${PORT}`);
+  console.log(`    API key set: ${!!(API_KEY && API_KEY !== 'YOUR_KEY_HERE')}\n`);
 });
